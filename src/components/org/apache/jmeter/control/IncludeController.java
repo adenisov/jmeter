@@ -21,8 +21,12 @@ package org.apache.jmeter.control;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.util.Collection;
 import java.util.LinkedList;
+import java.util.List;
 
+import org.apache.jmeter.exceptions.IllegalUserActionException;
+import org.apache.jmeter.gui.tree.JMeterTreeModel;
 import org.apache.jmeter.gui.tree.JMeterTreeNode;
 import org.apache.jmeter.save.SaveService;
 import org.apache.jmeter.services.FileServer;
@@ -30,6 +34,7 @@ import org.apache.jmeter.testelement.TestElement;
 import org.apache.jmeter.testelement.TestPlan;
 import org.apache.jmeter.util.JMeterUtils;
 import org.apache.jorphan.collections.HashTree;
+import org.apache.jorphan.collections.SearchByClass;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,6 +49,8 @@ public class IncludeController extends GenericController implements ReplaceableC
         JMeterUtils.getPropDefault(
                 "includecontroller.prefix", //$NON-NLS-1$
                 ""); //$NON-NLS-1$
+
+    private static final String WORKBENCH = "WorkBench";
 
     private HashTree subtree = null;
     private TestElement sub = null;
@@ -99,6 +106,37 @@ public class IncludeController extends GenericController implements ReplaceableC
      */
     @Override
     public HashTree getReplacementSubTree() {
+        /*
+        Hack
+        JMeter doesn't allow to import jmx test plans included into IncludeController and referenced by ModuleController
+        more than once (ie depth > 1). The problem is that reference to IC is relative to test plan, but while importing
+        we do not recalculate possible internal includes in newly referenced jmx test plan. This hack fixes this issue.
+         */
+
+        @SuppressWarnings("deprecation")
+        JMeterTreeModel treeModel = new JMeterTreeModel(new Object());
+        JMeterTreeNode root = (JMeterTreeNode) treeModel.getRoot();
+        try {
+            treeModel.addSubTree(this.subtree, root);
+        } catch (IllegalUserActionException e) {
+            log.warn("unable to create subtree model from import:" + getIncludePath(), e);
+        }
+        SearchByClass<ModuleController> moduleController = new SearchByClass<>(ModuleController.class);
+        this.subtree.traverse(moduleController);
+        Collection<ModuleController> moduleControllersRes = moduleController.getSearchResults();
+        for (ModuleController mc : moduleControllersRes) {
+            if (mc.getSelectedNode() == null) {
+                List<?> nodePath = mc.getNodePath();
+                if (nodePath != null && nodePath.size() > 0) {
+                    Object entry = nodePath.get(0);
+                    if (entry != null && entry.toString().equals(WORKBENCH)) {
+                        nodePath.remove(entry);
+                    }
+                }
+            }
+            mc.resolveReplacementSubTree(root);
+        }
+
         return subtree;
     }
 
@@ -177,13 +215,8 @@ public class IncludeController extends GenericController implements ReplaceableC
         for (Object o : new LinkedList<>(tree.list())) {
             TestElement item = (TestElement) o;
 
-            //if we found a TestPlan, then we are on our way to the TestFragment
+            //if we found a TestPlan, then gather all TestFragments from current tree node
             if (item instanceof TestPlan)
-            {
-                return getProperBranch(tree.getTree(item));
-            }
-
-            if (item instanceof TestFragmentController)
             {
                 return tree.getTree(item);
             }
@@ -197,7 +230,11 @@ public class IncludeController extends GenericController implements ReplaceableC
         for (Object o : new LinkedList<>(tree.list())) {
             TestElement item = (TestElement) o;
             if (!item.isEnabled()) {
-                tree.remove(item);
+                // TestFragmentController is used to hold IncludeController which references external jmx files
+                // we must keep such elements
+                if (!(item instanceof TestFragmentController)) {
+                    tree.remove(item);
+                }
             } else {
                 removeDisabledItems(tree.getTree(item));// Recursive call
             }
